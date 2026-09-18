@@ -1,6 +1,6 @@
 # jev-joust
 
-Two [TypeSafe Jev](https://typesafe.ai) players, one on each controller, in NES Joust. Bring your own ROM: `rom/joust.nes`, never committed.
+Two [TypeSafe Jev](https://typesafe.ai) players, one per controller, in NES Joust. Requires `rom/joust.nes`.
 
 Work in progress.
 
