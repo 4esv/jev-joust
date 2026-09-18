@@ -1,0 +1,6 @@
+[project]
+name = "jev-joust"
+version = "0.1.0"
+description = "TypeSafe Jev vs Jev in NES Joust, bring your own ROM"
+requires-python = ">=3.12,<3.13"
+dependencies = ["nes-py==8.2.1", "gym==0.26.2", "numpy<2", "httpx>=0.27", "imageio>=2.34", "pillow>=10"]

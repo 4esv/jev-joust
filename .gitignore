@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+rom/*
+!rom/README.md
+runs/*.log.jsonl
