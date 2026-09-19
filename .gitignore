@@ -5,3 +5,5 @@ __pycache__/
 rom/*
 !rom/README.md
 runs/*.log.jsonl
+runs/*.json
+runs/smoke.gif
