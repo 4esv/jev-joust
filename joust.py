@@ -2,7 +2,7 @@
 
     uv run python joust.py --scan     # interactive RAM scan: find the bytes that track each player
     uv run python joust.py --frames   # step a few hundred frames with scripted inputs and save a GIF
-    uv run python joust.py --play --p1 jev --p2 jev     # a match; bots are jev, rules or idle
+    uv run python joust.py --play --p1 jev --p2 jev     # a match; bots are jev, jev-tactic, rules or idle
 
 The scan drives one controller at a time and reports RAM addresses whose values move with the input,
 which is how the player x/y, lives and enemy slots get located without a published RAM map.
@@ -106,8 +106,11 @@ P_SCORE = (0xEB, 0xEE)  # three BCD bytes each, low byte first
 
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 USD_PER_TOKEN = 0.042 / 1e6
-DECIDE = 12  # frames per decision; one flap is one press of A
-FLAP_FRAMES = {0: (), 1: (0, 1, 2), 2: (0, 1, 2, 6, 7, 8)}
+DECIDE = 8  # frames per decision
+# One flap is one press of A. Measured from open air: no flaps falls 90 px in 48 frames, one per 12 frames
+# still falls 49, one per 6 holds height, one per 4 climbs 38.
+FLAP_PERIOD = {0: None, 1: 6, 2: 4}
+MOVES = {"left": "fly left", "right": "fly right", "none": "keep the current drift"}
 TACTICS = {
     "attack": "a rider is clearly below you and close enough to reach: fly into it from above",
     "climb": "the nearest rider is level with you or above you: gain height before engaging anyone",
@@ -115,8 +118,7 @@ TACTICS = {
 }
 INSTRUCTIONS = {
     "goal": "You ride a flying bird in Joust. When two riders touch, the higher one wins and the lower one "
-            "is killed. The rival player is a target like the enemies. Choose the tactic for the next fifth "
-            "of a second.",
+            "is killed. The rival player is a target like the enemies.",
     "state": "`others` lists every other rider, nearest first, as a sentence plus numbers: dx is pixels to "
              "your right (negative is left; the screen wraps), dy is pixels above you (negative is below).",
 }
@@ -184,6 +186,24 @@ def ask_jev(client: httpx.Client, state: dict) -> tuple[dict, int, float]:
     return {"tactic": a["choice"], "p": {k: round(v, 3) for k, v in a["probabilities"].items()}}, d["usage"]["input_tokens"], lat
 
 
+def ask_jev_direct(client: httpx.Client, state: dict) -> tuple[dict, int, float]:
+    """Jev on the controller: a Choice for the stick and a Noul for the flap button."""
+    body = {"state": state, "model": "jev-latest", "questions": {
+        "move": {"type": "choice", "instructions": [INSTRUCTIONS, "Which way should you fly now?"], "criteria": MOVES},
+        "flap": {"type": "noul", "instructions": [INSTRUCTIONS, "Should you be flapping now? Flapping climbs; "
+                 "not flapping falls, faster the longer it lasts. `you.height_above_floor` 0 is the floor."],
+                 "criteria": {"true": "gain height: someone near is level with you or above you, or you are low",
+                              "false": "lose height: you are well above your target and should drop onto it"}}}}
+    t0 = time.perf_counter()
+    r = client.post(JEV_URL, headers={"Authorization": f"Bearer {os.environ['TYPESAFE_API_KEY']}"}, json=body)
+    lat = time.perf_counter() - t0
+    r.raise_for_status()
+    d = r.json()
+    a = d["answers"]
+    return {"move": a["move"]["choice"], "flap_p": round(a["flap"]["noul"], 3),
+            "move_p": {k: round(v, 3) for k, v in a["move"]["probabilities"].items()}}, d["usage"]["input_tokens"], lat
+
+
 def rules(state: dict) -> dict:
     """Reference bot: the same three tactics picked by fixed thresholds on the nearest rider."""
     o = (state["others"] or [{"dy": -99, "distance": 999}])[0]
@@ -215,13 +235,15 @@ def play(game: Joust, bots: tuple[str, str], max_frames: int) -> dict:
     client, pool = httpx.Client(timeout=30), ThreadPoolExecutor(2)
     frames, log, tokens, lats = [], [], 0, []
     before = riders(game.ram)
-    last = [{"tactic": "climb"}, {"tactic": "climb"}]
+    last = [{}, {}]
     plan = [{"move": "none", "flap": 0}] * 2
     start_lives = [r["lives"] for r in before[:2]]
     frame = 0
 
     def decide(p: int, state: dict) -> tuple[dict, int, float]:
         if bots[p] == "jev":
+            return ask_jev_direct(client, state)
+        if bots[p] == "jev-tactic":
             return ask_jev(client, state)
         return (rules(state) if bots[p] == "rules" else {"tactic": "idle"}), 0, 0.0
 
@@ -232,16 +254,20 @@ def play(game: Joust, bots: tuple[str, str], max_frames: int) -> dict:
         states = [view(now, before, p, last[p]) for p in (0, 1)]
         answers = list(pool.map(decide, (0, 1), states))
         for p, (act, tok, lat) in enumerate(answers):
-            last[p] = {"tactic": act["tactic"]}
-            plan[p] = execute(act["tactic"], states[p]) if act["tactic"] != "idle" else {"move": "none", "flap": 0}
+            if "flap_p" in act:  # direct control: the answers are the buttons
+                plan[p] = {"move": act["move"], "flap": 2 if act["flap_p"] >= 0.5 else 0}
+                last[p] = dict(plan[p], flap="flapping" if plan[p]["flap"] else "not flapping")
+            else:
+                plan[p] = execute(act["tactic"], states[p]) if act["tactic"] != "idle" else {"move": "none", "flap": 0}
+                last[p] = {"tactic": act["tactic"]}
             tokens += tok
             if lat:
                 lats.append(lat)
         log.append({"frame": frame, "states": states, "answers": [a for a, _, _ in answers], "plans": list(plan)})
         before = now
         for f in range(DECIDE):
-            pads = [(press(a["move"]) if a["move"] != "none" else 0) | (press("A") if f in FLAP_FRAMES[a["flap"]] else 0)
-                    for a in plan]
+            pads = [(press(a["move"]) if a["move"] != "none" else 0)
+                    | (press("A") if FLAP_PERIOD[a["flap"]] and frame % FLAP_PERIOD[a["flap"]] < 2 else 0) for a in plan]
             obs, _ = game.step(*pads)
             frame += 1
             if frame % 3 == 0:
@@ -293,8 +319,8 @@ if __name__ == "__main__":
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--frames", action="store_true")
     ap.add_argument("--play", action="store_true")
-    ap.add_argument("--p1", default="jev", choices=["jev", "rules", "idle"])
-    ap.add_argument("--p2", default="jev", choices=["jev", "rules", "idle"])
+    ap.add_argument("--p1", default="jev", choices=["jev", "jev-tactic", "rules", "idle"])
+    ap.add_argument("--p2", default="jev", choices=["jev", "jev-tactic", "rules", "idle"])
     ap.add_argument("--max-frames", type=int, default=3600)
     a = ap.parse_args()
     game = Joust()
@@ -307,6 +333,6 @@ if __name__ == "__main__":
         frames_gif(game)
     if a.play:
         load_env()
-        if "jev" in (a.p1, a.p2) and not os.environ.get("TYPESAFE_API_KEY"):
+        if any(b.startswith("jev") for b in (a.p1, a.p2)) and not os.environ.get("TYPESAFE_API_KEY"):
             raise SystemExit("set TYPESAFE_API_KEY in .env")
         play(game, (a.p1, a.p2), a.max_frames)
