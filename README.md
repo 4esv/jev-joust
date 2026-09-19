@@ -2,7 +2,7 @@
 
 Two [TypeSafe Jev](https://typesafe.ai) players, one per controller, in NES Joust. Requires `rom/joust.nes`.
 
-![Jev vs Jev](runs/jev-vs-jev-tactic-20260919-160755.gif)
+![Jev vs Jev](runs/jev-vs-jev-20260919-160528.gif)
 
 One match per row, 2026-09-19, `jev-latest`, 2-player game A, up to 3600 frames; a match ends early when a player is out.
 
