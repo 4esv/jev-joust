@@ -1,12 +1,15 @@
 # jev-joust
 
-Two [TypeSafe Jev](https://typesafe.ai) players, one per controller, in NES Joust, playing for score. Requires `rom/joust.nes`.
+Two [TypeSafe Jev](https://typesafe.ai) players, one per controller, duelling in NES Joust for score.
+Requires `rom/joust.nes`.
 
 Every decision, code runs the emulator forward over each controller state a player could hold and writes down
 what actually happens. Jev reads those outcomes and picks one. Code does the arithmetic and the physics; Jev
 does the judging.
 
-![Jev vs greedy](runs/jev-vs-greedy-20260920-095547.gif)
+![Jev against Jev](runs/jev-vs-jev-20260920-101544.gif)
+
+Two Jev players duelling: player 1 outlasts player 2, who is knocked out having scored more, 5500 to 3000. Kills are the 500s, eggs the 250s; they reach wave 2.
 
 ## Results
 
