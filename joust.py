@@ -58,6 +58,8 @@ class Joust:
                 self.step(press(name), 0)
         for _ in range(600):  # lives are set ~70 frames after start, riders spawn ~130
             if 0 < int(self.ram[0x58]) < 240 and 0 < int(self.ram[0x59]) < 240:
+                for _ in range(24):  # the reserve counter decrements as each rider materializes; let it settle
+                    self.step(0, 0)
                 return
             self.step(0, 0)
         raise SystemExit("two-player game did not start")
@@ -103,10 +105,19 @@ def scan(game: Joust, presses: dict[str, int], frames: int = 60) -> None:
 P_X, P_Y, P_LIVES = 0x54, 0x58, 0xE9  # + player index
 E_X, E_Y, E_SLOTS, OFF = 0x720, 0x72E, 7, 240  # enemy slot arrays; y == 240 is off screen: empty slot, or a dead player
 P_SCORE = (0xEB, 0xEE)  # three BCD bytes each, low byte first
+OAM, EGG_TILE = 0x200, 204  # eggs are not in the object tables; they render as this sprite tile
+FLOOR = 196
+
+HORIZON = 24  # frames the candidate is held, 0.4 s
+TAIL = 72  # then it keeps flying neutrally for this long, so the option text can say whether it dies soon
+# Each candidate is a controller state held for the horizon. Flapping is one press of A per 4 frames.
+CANDIDATES = {"fly left and flap": ("left", True), "fly left and glide": ("left", False),
+              "fly right and flap": ("right", True), "fly right and glide": ("right", False),
+              "hold course and flap": (None, True), "hold course and glide": (None, False)}
 
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 USD_PER_TOKEN = 0.042 / 1e6
-DECIDE = 8  # frames per decision
+DECIDE = 12  # frames per decision; half the simulated horizon
 # One flap is one press of A. Measured from open air: no flaps falls 90 px in 48 frames, one per 12 frames
 # still falls 49, one per 6 holds height, one per 4 climbs 38.
 FLAP_PERIOD = {0: None, 1: 6, 2: 4}
@@ -122,6 +133,12 @@ INSTRUCTIONS = {
     "state": "`others` lists every other rider, nearest first, as a sentence plus numbers: dx is pixels to "
              "your right (negative is left; the screen wraps), dy is pixels above you (negative is below).",
 }
+
+
+def eggs(ram) -> list[dict]:
+    """Uncollected eggs, read from the sprite table; each is 250+ points for whoever reaches it."""
+    return [{"x": int(ram[OAM + 4 * k + 3]), "y": int(ram[OAM + 4 * k])}
+            for k in range(64) if int(ram[OAM + 4 * k + 1]) == EGG_TILE and int(ram[OAM + 4 * k]) < FLOOR]
 
 
 def wrap(d: int) -> int:
@@ -229,6 +246,163 @@ def execute(tactic: str, state: dict) -> dict:
     return {"move": side(near, False) if near["distance"] < 48 else "none", "flap": 2}
 
 
+def pad_for(direction: str | None, flap: bool, f: int) -> int:
+    """One frame of a held candidate: a direction plus a flap every 4 frames (the measured climb rate)."""
+    return (press(direction) if direction else 0) | (press("A") if flap and f % 4 < 2 else 0)
+
+
+def relation(r, me: int) -> tuple[dict | None, list[dict]]:
+    """The nearest other rider and the eggs, relative to player `me`."""
+    rs = riders(r)
+    m = rs[me]
+    others = [o for o in rs if o is not m and o["y"] != OFF]
+    for o in others:
+        # dy is positive when the other rider is higher on screen, that is above you and winning a contact.
+        o["dx"], o["dy"] = wrap(o["x"] - m["x"]), m["y"] - o["y"]
+        o["dist"] = abs(o["dx"]) + abs(o["dy"])
+    others.sort(key=lambda o: o["dist"])
+    es = eggs(r)
+    for e in es:
+        e["dist"] = abs(wrap(e["x"] - m["x"])) + abs(e["y"] - m["y"])
+    es.sort(key=lambda e: e["dist"])
+    return (others[0] if others else None), es
+
+
+def simulate(game: "Joust", me: int, cand: str, other: tuple) -> dict:
+    """Hold one candidate for HORIZON frames, then fly neutrally for TAIL, and report what actually
+    happened. The position reported is where the held part put you; the death covers the whole window."""
+    d, fl = CANDIDATES[cand]
+    r = game.ram
+    s0 = score(r, me)
+    alive0 = int(r[P_Y + me]) != OFF
+    near0, eggs0 = relation(r, me)
+    # NOTE: a death is the rider leaving play, not the lives counter moving: that counter holds reserves and
+    # decrements when a rider materializes, so at spawn it drops with nobody touching anyone.
+    # The candidate is held for HORIZON and then flown neutrally for TAIL, so a death that the held part
+    # only sets up still shows up in the option text. Measuring only the held part hides every death here.
+    died = False
+    snap = None
+    for f in range(HORIZON + TAIL):
+        pads = [0, 0]
+        pads[me] = pad_for(d, fl, f) if f < HORIZON else pad_for(None, True, f)
+        pads[1 - me] = pad_for(other[0], other[1], f)
+        game.step(*pads)
+        died = died or (alive0 and int(r[P_Y + me]) == OFF)
+        if f == HORIZON - 1:  # the actionable part: where holding this option puts you
+            near_h, eggs_h = relation(r, me)
+            snap = (int(r[P_Y + me]), score(r, me) - s0, near_h, eggs_h)
+    y, pts_h, near1, eggs1 = snap
+    return {"died": died,
+            "points": max(pts_h, score(r, me) - s0),
+            "height": None if y == OFF else FLOOR - y,
+            "near": near1,
+            "closed_on_rider": bool(near0 and near1 and near1["dist"] < near0["dist"]),
+            "eggs_left": len(eggs1),
+            "egg_gain": (eggs0[0]["dist"] - eggs1[0]["dist"]) if eggs0 and eggs1 else 0,
+            "egg_dist": eggs1[0]["dist"] if eggs1 else None}
+
+
+def describe(o: dict) -> str:
+    if o["died"]:
+        return "you are killed" + (f" after scoring {o['points']} points" if o["points"] else "")
+    bits = []
+    if o["points"]:
+        bits.append(f"scores {o['points']} points")
+    bits.append(f"ends {o['height']} px above the floor")
+    n = o["near"]
+    if n:
+        where = "above you" if n["dy"] > 6 else "below you" if n["dy"] < -6 else "level with you"
+        who = "the rival player" if n["who"].startswith("player") else n["who"]
+        # Name the points, not just the geometry: being above a rider and near it is what a kill is made of.
+        if n["dy"] < -6 and n["dist"] < 56:
+            verdict = ", you are above it and in range to kill it for 500 points"
+        elif n["dy"] < -6:
+            verdict = ", you are above it, so closing the gap scores"
+        elif n["dy"] > 6 and n["dist"] < 56:
+            verdict = ", it is above you and in range to kill you"
+        elif n["dy"] > 6:
+            verdict = ", it is above you, so closing the gap is fatal"
+        else:
+            verdict = ", level with you, which settles nothing"
+        bits.append(f"{who} {abs(n['dy'])} px {where} and {n['dist']} px away"
+                    + (" and closing" if o["closed_on_rider"] else "") + verdict)
+    if o["egg_dist"] is not None:
+        bits.append(f"nearest egg {o['egg_dist']} px away, worth 250 points for free"
+                    + (" and you are closing on it" if o["egg_gain"] > 0 else ""))
+    return ", ".join(bits)
+
+
+def outcomes_for(game: "Joust", me: int, other: tuple) -> dict[str, dict]:
+    """Simulate every candidate from the same instant. One snapshot slot, so rewind between each."""
+    game.snapshot()
+    out = {}
+    for cand in CANDIDATES:
+        out[cand] = simulate(game, me, cand, other)
+        game.rewind()
+    return out
+
+
+def label_state(outs: dict[str, dict]) -> tuple[str, dict, bool]:
+    """The candidate that actually turns out best over the same window the option text describes."""
+    rank = lambda o: (not o["died"], o["points"])
+    best = max(outs.items(), key=lambda kv: rank(kv[1]))[0]
+    decisive = len({rank(o) for o in outs.values()}) > 1  # else every option is worth the same
+    return best, {c: {"died": o["died"], "points": o["points"]} for c, o in outs.items()}, decisive
+
+
+def situation(r, me: int) -> dict:
+    """What the player can see right now; the options carry what happens next."""
+    near, es = relation(r, me)
+    rs = riders(r)
+    m = rs[me]
+    others = sorted([o for o in rs if o is not m and o["y"] != OFF],
+                    key=lambda o: abs(wrap(o["x"] - m["x"])) + abs(m["y"] - o["y"]))[:3]
+    def line(o):
+        dx, dy = wrap(o["x"] - m["x"]), m["y"] - o["y"]
+        return {"who": "the rival player" if o["who"].startswith("player") else o["who"],
+                "summary": f"{abs(dy)} px {'above' if dy > 6 else 'below' if dy < -6 else 'level with'} you, "
+                           f"{abs(dx)} px to your {'right' if dx > 0 else 'left'}"}
+    return {"height_above_floor": FLOOR - m["y"] if m["y"] != OFF else None,
+            "respawns_left": m["lives"], "score": score(r, me),
+            "riders_near_you": [line(o) for o in others],
+            "uncollected_eggs_on_screen": len(es)}
+
+
+CANDIDATE_INSTRUCTIONS = (
+    "You ride a flying bird in Joust and you are trying to score as many points as possible. Points come from "
+    "killing riders and from collecting the eggs they leave behind. When two riders touch, the one that is "
+    "higher kills the lower one, so height decides every fight. An egg is free points and costs nothing: "
+    "collect one whenever no rider threatens you. The rival player is a target like the enemies.\n"
+    "Each option below says what actually happens if you hold it for the next 0.4 seconds, measured by "
+    "running the game forward. Pick the option that gains the most points without being killed. Never pick "
+    "an option that kills you while another option survives. You get another decision half way through, "
+    "so an option that sets up a kill is worth as much as one that scores now."
+)
+
+
+def ask_jev_candidates(client: httpx.Client, state: dict, criteria: dict[str, str]) -> tuple[dict, int, float]:
+    body = {"state": state, "model": "jev-latest", "questions": {
+        "action": {"type": "choice", "instructions": CANDIDATE_INSTRUCTIONS, "criteria": criteria}}}
+    t0 = time.perf_counter()
+    r = client.post(JEV_URL, headers={"Authorization": f"Bearer {os.environ['TYPESAFE_API_KEY']}"}, json=body)
+    lat = time.perf_counter() - t0
+    r.raise_for_status()
+    d = r.json()
+    a = d["answers"]["action"]
+    return {"action": a["choice"], "p": {k: round(v, 3) for k, v in a["probabilities"].items()}}, d["usage"]["input_tokens"], lat
+
+
+def greedy_pick(outs: dict[str, dict]) -> str:
+    """Deterministic control over the same candidates: survive, take points, get above the nearest rider."""
+    def rank(kv):
+        c, o = kv
+        n = o["near"]
+        # -dy: prefer ending with the nearest rider below you, which is the side that wins a contact.
+        return (not o["died"], o["points"], o["egg_gain"] if o["egg_dist"] is not None else 0,
+                (-n["dy"] if n else 0), o["height"] or 0)
+    return max(outs.items(), key=rank)[0]
+
+
 def play(game: Joust, bots: tuple[str, str], max_frames: int) -> dict:
     RUNS.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -236,25 +410,41 @@ def play(game: Joust, bots: tuple[str, str], max_frames: int) -> dict:
     frames, log, tokens, lats = [], [], 0, []
     before = riders(game.ram)
     last = [{}, {}]
+    held = [(None, False), (None, False)]  # each player's last held candidate, used when simulating the other
     plan = [{"move": "none", "flap": 0}] * 2
     start_lives = [r["lives"] for r in before[:2]]
     frame = 0
 
     def decide(p: int, state: dict) -> tuple[dict, int, float]:
         if bots[p] == "jev":
+            return ask_jev_candidates(client, state[0], state[1])
+        if bots[p] == "jev-noul":
             return ask_jev_direct(client, state)
         if bots[p] == "jev-tactic":
             return ask_jev(client, state)
+        if bots[p] == "greedy":
+            return {"action": greedy_pick(state[2])}, 0, 0.0
         return (rules(state) if bots[p] == "rules" else {"tactic": "idle"}), 0, 0.0
 
     while frame < max_frames:
         now = riders(game.ram)
         if any(out_of_game(r) for r in now[:2]):
             break
-        states = [view(now, before, p, last[p]) for p in (0, 1)]
+        states = []
+        for p in (0, 1):
+            if bots[p] in ("jev", "greedy"):
+                outs = outcomes_for(game, p, held[1 - p])
+                states.append((situation(game.ram, p), {c: describe(o) for c, o in outs.items()}, outs))
+            else:
+                states.append(view(now, before, p, last[p]))
         answers = list(pool.map(decide, (0, 1), states))
         for p, (act, tok, lat) in enumerate(answers):
-            if "flap_p" in act:  # direct control: the answers are the buttons
+            if "action" in act:  # candidate search: the answer names a held controller state
+                d, fl = CANDIDATES[act["action"]]
+                held[p] = (d, fl)
+                plan[p] = {"cand": act["action"]}
+                last[p] = {"action": act["action"]}
+            elif "flap_p" in act:  # direct control: the answers are the buttons
                 plan[p] = {"move": act["move"], "flap": 2 if act["flap_p"] >= 0.5 else 0}
                 last[p] = dict(plan[p], flap="flapping" if plan[p]["flap"] else "not flapping")
             else:
@@ -263,10 +453,12 @@ def play(game: Joust, bots: tuple[str, str], max_frames: int) -> dict:
             tokens += tok
             if lat:
                 lats.append(lat)
-        log.append({"frame": frame, "states": states, "answers": [a for a, _, _ in answers], "plans": list(plan)})
+        log.append({"frame": frame, "states": states, "answers": [a for a, _, _ in answers], "plans": list(plan),
+                    "options": [s[1] if isinstance(s, tuple) else None for s in states]})
         before = now
         for f in range(DECIDE):
-            pads = [(press(a["move"]) if a["move"] != "none" else 0)
+            pads = [pad_for(*CANDIDATES[a["cand"]], f) if "cand" in a else
+                    (press(a["move"]) if a["move"] != "none" else 0)
                     | (press("A") if FLAP_PERIOD[a["flap"]] and frame % FLAP_PERIOD[a["flap"]] < 2 else 0) for a in plan]
             obs, _ = game.step(*pads)
             frame += 1
@@ -288,6 +480,97 @@ def play(game: Joust, bots: tuple[str, str], max_frames: int) -> dict:
     print(json.dumps(result))
     print(f"wrote runs/{name}.gif and .json")
     return result
+
+
+DATA = Path(__file__).resolve().parent / "data"
+
+
+def record(game: "Joust", n: int) -> None:
+    """Play greedy and save decision states, each labelled by which option the game says turns out best."""
+    DATA.mkdir(exist_ok=True)
+    rows, held, frame, seen, restarts = [], [(None, False), (None, False)], 0, 0, 0
+    while len(rows) < n:
+        for p in (0, 1):
+            if int(game.ram[P_Y + p]) == OFF:
+                continue
+            outs = outcomes_for(game, p, held[1 - p])
+            gold, detail, decisive = label_state(outs)
+            seen += 1
+            if decisive:  # keep only states where the options are genuinely worth different amounts
+                rows.append({"id": f"s{len(rows):04d}", "frame": frame, "player": p,
+                             "situation": situation(game.ram, p),
+                             "options": {c: describe(o) for c, o in outs.items()},
+                             "label": gold, "rollout": detail})
+            held[p] = CANDIDATES[greedy_pick(outs)]
+            if len(rows) >= n:
+                break
+        for f in range(DECIDE):
+            game.step(pad_for(*held[0], f), pad_for(*held[1], f))
+            frame += 1
+        if any(out_of_game(r) for r in riders(game.ram)[:2]) or frame > 20000:
+            restarts += 1
+            print(f"  game over after {frame} frames, {len(rows)} kept; restarting")
+            game.__init__()
+            held, frame = [(None, False), (None, False)], 0
+            if restarts > 4:
+                break
+    (DATA / "states.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    counts = {}
+    for r in rows:
+        counts[r["label"]] = counts.get(r["label"], 0) + 1
+    print(f"wrote data/states.jsonl, {len(rows)} of {seen} decisions kept as decisive; label counts {counts}")
+
+
+def greedy_from_text(r: dict) -> str:
+    """The deterministic control, scored on the same recorded states: it reads the same option sentences."""
+    def rank(kv):
+        c, t = kv
+        dy = 0
+        if " px above you" in t:
+            dy = 1
+        elif " px below you" in t:
+            dy = -1
+        return ("killed" not in t, "scores" in t, -dy, int(t.split("ends ")[1].split(" px")[0]) if "ends " in t else 0)
+    return max(r["options"].items(), key=rank)[0]
+
+
+def offline() -> None:
+    """Ask Jev each recorded state and score it against the rollout label. No emulator, no match."""
+    rows = [json.loads(l) for l in (DATA / "states.jsonl").read_text().splitlines()]
+    client = httpx.Client(timeout=30)
+    def best_set(r) -> set:
+        """Every candidate that ties for the best rollout; picking any of them is optimal."""
+        rank = lambda v: (not v["died"], v["points"])
+        top = max(rank(v) for v in r["rollout"].values())
+        return {c for c, v in r["rollout"].items() if rank(v) == top}
+
+    ok = fatal = tokens = 0
+    lats, picked, confs = [], {}, []
+    for r in rows:
+        ans, tok, lat = ask_jev_candidates(client, r["situation"], r["options"])
+        tokens += tok
+        lats.append(lat)
+        picked[ans["action"]] = picked.get(ans["action"], 0) + 1
+        ok += ans["action"] in best_set(r)
+        confs.append(max(ans["p"].values()))
+        dies = r["options"][ans["action"]].startswith("you are killed")
+        safe = any(not t.startswith("you are killed") for t in r["options"].values())
+        fatal += dies and safe
+    n = len(rows)
+    # Baselines over the same states: always play the single most often optimal option, and pick at random.
+    fixed = max(CANDIDATES, key=lambda c: sum(c in best_set(r) for r in rows))
+    chance = float(np.mean([len(best_set(r)) / len(CANDIDATES) for r in rows]))
+    greedy_ok = sum(greedy_from_text(r) in best_set(r) for r in rows)
+    print(json.dumps({"n": n, "jev_optimal": round(ok / n, 3),
+                      "best_fixed_option": f"{fixed} {sum(fixed in best_set(r) for r in rows) / n:.3f}",
+                      "random_pick": round(chance, 3),
+                      "greedy_optimal": round(greedy_ok / n, 3),
+                      "chose_an_option_its_text_calls_fatal_with_a_safe_one_offered": fatal,
+                      "states_offering_a_fatal_option": sum(
+                          1 for r in rows if any(t.startswith("you are killed") for t in r["options"].values())),
+                      "mean_confidence": round(float(np.mean(confs)), 3),
+                      "input_tokens": tokens, "cost_usd": round(tokens * USD_PER_TOKEN, 5),
+                      "latency_p50_s": round(float(np.median(lats)), 3), "jev_picks": picked}, indent=1))
 
 
 def load_env() -> None:
@@ -319,8 +602,10 @@ if __name__ == "__main__":
     ap.add_argument("--scan", action="store_true")
     ap.add_argument("--frames", action="store_true")
     ap.add_argument("--play", action="store_true")
-    ap.add_argument("--p1", default="jev", choices=["jev", "jev-tactic", "rules", "idle"])
-    ap.add_argument("--p2", default="jev", choices=["jev", "jev-tactic", "rules", "idle"])
+    ap.add_argument("--record", type=int, default=0, metavar="N", help="play greedy and write N labelled states to data/states.jsonl")
+    ap.add_argument("--offline", action="store_true", help="replay data/states.jsonl against Jev and report accuracy")
+    ap.add_argument("--p1", default="jev", choices=["jev", "jev-noul", "jev-tactic", "greedy", "rules", "idle"])
+    ap.add_argument("--p2", default="jev", choices=["jev", "jev-noul", "jev-tactic", "greedy", "rules", "idle"])
     ap.add_argument("--max-frames", type=int, default=3600)
     a = ap.parse_args()
     game = Joust()
@@ -331,6 +616,12 @@ if __name__ == "__main__":
         })
     if a.frames:
         frames_gif(game)
+    if a.record:
+        load_env()
+        record(game, a.record)
+    if a.offline:
+        load_env()
+        offline()
     if a.play:
         load_env()
         if any(b.startswith("jev") for b in (a.p1, a.p2)) and not os.environ.get("TYPESAFE_API_KEY"):

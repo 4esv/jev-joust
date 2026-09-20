@@ -1,61 +1,103 @@
 # jev-joust
 
-Two [TypeSafe Jev](https://typesafe.ai) players, one per controller, in NES Joust. Requires `rom/joust.nes`.
+Two [TypeSafe Jev](https://typesafe.ai) players, one per controller, in NES Joust, playing for score. Requires `rom/joust.nes`.
 
-![Jev vs Jev](runs/jev-vs-jev-20260919-160528.gif)
+Every decision, code runs the emulator forward over each controller state a player could hold and writes down
+what actually happens. Jev reads those outcomes and picks one. Code does the arithmetic and the physics; Jev
+does the judging.
 
-One match per row, 2026-09-19, `jev-latest`, 2-player game A, up to 3600 frames; a match ends early when a player is out.
+![Jev vs greedy](runs/jev-vs-greedy-20260920-095547.gif)
 
-| player 1 | player 2 | frames | lives lost | score | Jev calls | cost |
+## Results
+
+On 80 recorded decisions where the options are worth different amounts, scored against what the game itself
+says turns out best:
+
+| picked by | optimal option | chose an option its own text calls fatal |
+|---|---|---|
+| Jev | 0.91–0.95 over four runs | 0 of 62 states offering one |
+| `greedy`, same options | 0.90 | 0 |
+| always the best single option | 0.725 | – |
+| at random | 0.567 | – |
+
+Eight matches, 2026-09-20, `jev-latest`, 2-player game A, up to 3600 frames. `greedy` ranks the same
+simulated options by a fixed rule, so a match against it compares the judgment and nothing else.
+
+| player 1 | player 2 | frames | winner | score | lives lost | cost |
 |---|---|---|---|---|---|---|
-| jev | jev | 1280 | 3 / 5 | 1000 / 1000 | 320 | $0.013 |
-| jev | rules | 2896 | 5 / 4 | 2250 / 3500 | 362 | $0.013 |
-| rules | jev | 1208 | 2 / 5 | 1000 / 250 | 151 | $0.006 |
-| jev | jev-tactic | 1584 | 2 / 5 | 1000 / 1000 | 396 | $0.013 |
-| jev-tactic | jev | 1824 | 5 / 5 | 500 / 750 | 456 | $0.017 |
-| jev-tactic | rules | 3600 | 5 / 3 | 1750 / 5000 | 450 | $0.014 |
-| rules | jev-tactic | 3600 | 3 / 5 | 2750 / 1750 | 450 | $0.013 |
-| rules | rules | 3600 | 5 / 5 | 2750 / 750 | 0 | $0.000 |
+| jev | greedy | 3576 | jev | 3500 / 1000 | 4 / 5 | $0.011 |
+| greedy | jev | 3600 | neither | 9500 / 4000 | 3 / 4 | $0.011 |
+| jev | rules | 2580 | jev | 8500 / 500 | 4 / 5 | $0.008 |
+| rules | jev | 2400 | jev | 0 / 5500 | 5 / 2 | $0.008 |
+| greedy | rules | 3600 | neither | 7500 / 3000 | 1 / 5 | $0.000 |
+| rules | greedy | 3600 | neither | 2500 / 7750 | 5 / 2 | $0.000 |
+| jev | jev | 2376 | jev | 3000 / 5500 | 2 / 5 | $0.014 |
+| greedy | greedy | 3600 | neither | 4000 / 9500 | 3 / 3 | $0.000 |
 
-| bot | seats | lives lost per 1000 frames | score per 1000 frames |
+| bot | seats | score per 1000 frames | lives lost per 1000 frames |
 |---|---|---|---|
-| `rules` | 6 | 1.19 | 851 |
-| `jev-tactic` | 4 | 1.89 | 471 |
-| `jev` | 6 | 2.48 | 621 |
+| `jev` | 6 | 1774 | 1.24 |
+| `greedy` | 6 | 1819 | 0.79 |
+| `rules` | 4 | 493 | 1.64 |
 
-`jev`'s flap Noul follows the situation; its stick Choice barely does. Over 239 decisions: mean p(flap) 0.77 with the nearest rider more than 20 px above, 0.67 within 20 px of level, 0.47 and 0.46 with it 20–60 and over 60 px below, 0.80 within 25 px of the floor. The stick pointed toward a lower rider in 38 of 60 decisions and away from a higher one in 27 of 47.
+Jev and the fixed rule score at about the same rate, 1774 against 1819 points per 1000 frames. In the six
+matches between different bots, Jev knocked its opponent out 3 times and the fixed rule 0, and Jev paid for
+that with half again as many deaths. Both beat `rules`, which decides without simulated options. One match
+per pairing, and player 2 outscored player 1 in both mirror matches, so the table ranks nothing on its own.
 
-Median Jev latency 0.19 s; about 900 input tokens per `jev` call, 720 per `jev-tactic` call.
+Median Jev latency 0.18 s, about 830 input tokens per call, one call per player per decision.
 
 ## Run
 
 ```bash
 cp .env.example .env        # TYPESAFE_API_KEY
 uv sync
-uv run python joust.py --play --p1 jev --p2 jev       # a match; bots are jev, jev-tactic, rules or idle
-uv run python joust.py --play --p1 jev --p2 rules --max-frames 7200
-uv run python joust.py --scan       # hold each input on each controller, print RAM addresses that move with it
-uv run python joust.py --frames     # scripted inputs on both controllers, writes runs/smoke.gif
+uv run python joust.py --play --p1 jev --p2 greedy      # a match; bots below
+uv run python joust.py --record 80                      # write labelled decisions to data/states.jsonl
+uv run python joust.py --offline                        # score Jev on them; no emulator, no match
+uv run --group dev pytest
 ```
 
-A match writes `runs/<p1>-vs-<p2>-<stamp>.gif`, a `.json` with every state, answer and controller plan, and a line in `runs/results.jsonl`. It ends when a player is out of lives or at `--max-frames` (default 3600, one minute of game time).
+| bot | decides by |
+|---|---|
+| `jev` | one Choice over the six simulated options |
+| `greedy` | a fixed ranking over the same six options |
+| `jev-tactic` | one Choice of `attack`, `climb` or `evade`, flown by code |
+| `jev-noul` | a Choice for the stick and a Noul for the flap button |
+| `rules` | fixed thresholds, flown by the same code as `jev-tactic` |
+| `idle` | nothing |
+
+A match writes `runs/<p1>-vs-<p2>-<stamp>.gif`, a `.json` with every state, option and answer, and a line in
+`runs/results.jsonl`. It ends when a player is out of respawns or at `--max-frames`.
 
 ## Notes
 
-- Every 8 frames each player gets its own view of the game as JSON: itself, then every other rider nearest first, as a sentence plus numbers. Both requests run concurrently; the emulator waits for them.
-- `jev` holds the controller: a Choice (`left`, `right`, `none`) is the stick and a Noul is the flap button, flapping at one press per 4 frames while the answer is 0.5 or more.
-- `jev-tactic` answers one Choice (`attack`, `climb`, `evade`) and code flies it. `rules` picks among the same tactics with fixed thresholds and shares that executor.
-- Flap rates, measured from open air over 48 frames: no flaps falls 90 px, one per 12 frames falls 49, one per 6 holds height, one per 4 climbs 38.
-- Platforms and eggs are not in the state.
-- RAM map (no published one; found with `--scan`, by matching bytes against sprite positions, and by reading the HUD):
+- The six options are every combination of left, right or no direction with flapping or gliding. Each is held
+  for 24 frames and then flown neutrally for 72 more; the sentence describing it covers that whole window.
+- That window is what made the difference. Describing only the 24 held frames never once mentioned death,
+  while 130 of 480 options died within 96 frames, so the text could not show the danger the instructions asked
+  about. Widening it took optimal picks from 0.588 to 0.938 and fatal picks from 18 to 0.
+- Naming the points in the option text, rather than only the geometry, tripled Jev's score across the two
+  `greedy` matches, from 2500 to 7500, and cost it three more lives. Offline accuracy did not move, because
+  that label settles survival first and Jev was already near the ceiling on it.
+- Flap rates, measured from open air over 48 frames: no flaps falls 90 px, one per 12 frames falls 49, one per
+  6 holds height, one per 4 climbs 38.
+- `--record` keeps only decisions where the options are worth different amounts; on the rest every answer is
+  equally good and the label would be arbitrary. That was 80 of 298.
+- Eggs are read from the sprite table, where they are tile 204. Platforms are never modelled: an option that
+  flies into one already reports where it ended up.
+- RAM map (no published one; found with `--scan`, by matching bytes against sprite positions, and by reading
+  the HUD):
 
 | bytes | meaning |
 |---|---|
 | `0x54+p`, `0x58+p` | player x, y; y = 240 while dead |
-| `0xE9+p` | respawns left |
+| `0xE9+p` | respawns left; it drops when a rider materialises, so it does not mark a death |
 | `0xEB..0xED`, `0xEE..0xF0` | score, BCD, low byte first |
 | `0x720+i`, `0x72E+i`, i < 7 | enemy x, y; y = 240 is an empty slot |
 
 - Boot: the title appears near frame 600; Select three times moves the cursor to `2 PLAYER GAME A`, then Start.
 - nes-py wires only controller 0 through `step()`; `Joust.step(p1, p2)` writes controller 1's buffer before stepping.
 - Snapshot/restore via nes-py's `_backup`/`_restore`, as in [jev-mario](https://github.com/4esv/jev-mario).
+- Caveats: one match per pairing; player 2 outscored player 1 in both mirror matches, so seats are not equal;
+  the recorded states come from `greedy`'s play and inherit its habits; wave 1 only.
