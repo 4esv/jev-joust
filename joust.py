@@ -106,7 +106,9 @@ P_X, P_Y, P_LIVES = 0x54, 0x58, 0xE9  # + player index
 E_X, E_Y, E_SLOTS, OFF = 0x720, 0x72E, 7, 240  # enemy slot arrays; y == 240 is off screen: empty slot, or a dead player
 P_SCORE = (0xEB, 0xEE)  # three BCD bytes each, low byte first
 OAM, EGG_TILE = 0x200, 204  # eggs are not in the object tables; they render as this sprite tile
+WAVE = 0x3A  # 1 at boot, +1 as each new wave spawns
 FLOOR = 196
+CEILING = 170  # above this you are against the roof, where you bounce and riders can get over you
 
 HORIZON = 24  # frames the candidate is held, 0.4 s
 TAIL = 72  # then it keeps flying neutrally for this long, so the option text can say whether it dies soon
@@ -251,8 +253,8 @@ def pad_for(direction: str | None, flap: bool, f: int) -> int:
     return (press(direction) if direction else 0) | (press("A") if flap and f % 4 < 2 else 0)
 
 
-def relation(r, me: int) -> tuple[dict | None, list[dict]]:
-    """The nearest other rider and the eggs, relative to player `me`."""
+def relation(r, me: int) -> tuple[dict | None, list[dict], list[dict]]:
+    """The nearest other rider, the eggs, and every rider, all relative to player `me`."""
     rs = riders(r)
     m = rs[me]
     others = [o for o in rs if o is not m and o["y"] != OFF]
@@ -265,7 +267,7 @@ def relation(r, me: int) -> tuple[dict | None, list[dict]]:
     for e in es:
         e["dist"] = abs(wrap(e["x"] - m["x"])) + abs(e["y"] - m["y"])
     es.sort(key=lambda e: e["dist"])
-    return (others[0] if others else None), es
+    return (others[0] if others else None), es, others
 
 
 def simulate(game: "Joust", me: int, cand: str, other: tuple) -> dict:
@@ -275,7 +277,7 @@ def simulate(game: "Joust", me: int, cand: str, other: tuple) -> dict:
     r = game.ram
     s0 = score(r, me)
     alive0 = int(r[P_Y + me]) != OFF
-    near0, eggs0 = relation(r, me)
+    near0, eggs0, _ = relation(r, me)
     # NOTE: a death is the rider leaving play, not the lives counter moving: that counter holds reserves and
     # decrements when a rider materializes, so at spawn it drops with nobody touching anyone.
     # The candidate is held for HORIZON and then flown neutrally for TAIL, so a death that the held part
@@ -289,9 +291,12 @@ def simulate(game: "Joust", me: int, cand: str, other: tuple) -> dict:
         game.step(*pads)
         died = died or (alive0 and int(r[P_Y + me]) == OFF)
         if f == HORIZON - 1:  # the actionable part: where holding this option puts you
-            near_h, eggs_h = relation(r, me)
-            snap = (int(r[P_Y + me]), score(r, me) - s0, near_h, eggs_h)
-    y, pts_h, near1, eggs1 = snap
+            near_h, eggs_h, all_h = relation(r, me)
+            snap = (int(r[P_Y + me]), score(r, me) - s0, near_h, eggs_h, all_h)
+    y, pts_h, near1, eggs1, all1 = snap
+    # The walkthrough's pair ambush: the rider that kills you is usually not the one you are chasing but a
+    # second one arriving higher. Report the nearest rider that ends up above you, whoever it is.
+    above = [o for o in all1 if o["dy"] > 6 and o["dist"] < 96]
     return {"died": died,
             "points": max(pts_h, score(r, me) - s0),
             "height": None if y == OFF else FLOOR - y,
@@ -299,7 +304,9 @@ def simulate(game: "Joust", me: int, cand: str, other: tuple) -> dict:
             "closed_on_rider": bool(near0 and near1 and near1["dist"] < near0["dist"]),
             "eggs_left": len(eggs1),
             "egg_gain": (eggs0[0]["dist"] - eggs1[0]["dist"]) if eggs0 and eggs1 else 0,
-            "egg_dist": eggs1[0]["dist"] if eggs1 else None}
+            "egg_dist": eggs1[0]["dist"] if eggs1 else None,
+            "threat": min(above, key=lambda o: o["dist"]) if above else None,
+            "at_ceiling": bool(y != OFF and FLOOR - y > CEILING)}
 
 
 def describe(o: dict) -> str:
@@ -326,6 +333,12 @@ def describe(o: dict) -> str:
             verdict = ", level with you, which settles nothing"
         bits.append(f"{who} {abs(n['dy'])} px {where} and {n['dist']} px away"
                     + (" and closing" if o["closed_on_rider"] else "") + verdict)
+    t = o.get("threat")
+    if t and (not n or t["who"] != n["who"]):
+        who_t = "the rival player" if t["who"].startswith("player") else t["who"]
+        bits.append(f"and {who_t} is also above you, {t['dist']} px away, in position to kill you while you go for the other")
+    if o.get("at_ceiling"):
+        bits.append("you are against the roof here, where you bounce and riders can get above you")
     if o["egg_dist"] is not None:
         bits.append(f"nearest egg {o['egg_dist']} px away, worth 250 points for free"
                     + (" and you are closing on it" if o["egg_gain"] > 0 else ""))
@@ -352,7 +365,7 @@ def label_state(outs: dict[str, dict]) -> tuple[str, dict, bool]:
 
 def situation(r, me: int) -> dict:
     """What the player can see right now; the options carry what happens next."""
-    near, es = relation(r, me)
+    near, es, _ = relation(r, me)
     rs = riders(r)
     m = rs[me]
     others = sorted([o for o in rs if o is not m and o["y"] != OFF],
@@ -362,22 +375,33 @@ def situation(r, me: int) -> dict:
         return {"who": "the rival player" if o["who"].startswith("player") else o["who"],
                 "summary": f"{abs(dy)} px {'above' if dy > 6 else 'below' if dy < -6 else 'level with'} you, "
                            f"{abs(dx)} px to your {'right' if dx > 0 else 'left'}"}
-    return {"height_above_floor": FLOOR - m["y"] if m["y"] != OFF else None,
+    return {"wave": int(r[WAVE]),
+            "height_above_floor": FLOOR - m["y"] if m["y"] != OFF else None,
             "respawns_left": m["lives"], "score": score(r, me),
             "riders_near_you": [line(o) for o in others],
             "uncollected_eggs_on_screen": len(es)}
 
 
-CANDIDATE_INSTRUCTIONS = (
-    "You ride a flying bird in Joust and you are trying to score as many points as possible. Points come from "
-    "killing riders and from collecting the eggs they leave behind. When two riders touch, the one that is "
-    "higher kills the lower one, so height decides every fight. An egg is free points and costs nothing: "
-    "collect one whenever no rider threatens you. The rival player is a target like the enemies.\n"
-    "Each option below says what actually happens if you hold it for the next 0.4 seconds, measured by "
-    "running the game forward. Pick the option that gains the most points without being killed. Never pick "
-    "an option that kills you while another option survives. You get another decision half way through, "
-    "so an option that sets up a kill is worth as much as one that scores now."
-)
+CANDIDATE_INSTRUCTIONS = {
+    "game": "You ride a flying bird in Joust and you are trying to score as many points as possible. Points "
+            "come from killing riders and from collecting the eggs they leave behind. When two riders touch, "
+            "the higher one kills the lower one, so height decides every fight. The rival player is a target "
+            "like the enemies.",
+    "options": "Each option below says what actually happens if you hold it, measured by running the game "
+               "forward. Pick the option that gains the most points without being killed. Never pick an "
+               "option that kills you while another option survives. You get another decision part way "
+               "through, so an option that sets up a kill is worth as much as one that scores now.",
+    "how good players play": [
+        "Let the enemies come to you rather than chasing them. Holding a good position and letting a rider "
+        "fly into you from below kills it; chasing one across the screen gets you killed.",
+        "The rider that kills you is usually not the one you are attacking. It is a second one arriving from "
+        "above while you commit. When an option says someone is above you, treat that as the real threat.",
+        "Do not sit against the roof. You bounce off it, you cannot gain height, and riders get above you.",
+        "You cannot turn sharply in the air. Speed carries, so prefer options that keep your momentum over "
+        "options that fight it.",
+        "A life is worth far more than an egg. Take eggs only when no rider is above you or closing.",
+    ],
+}
 
 
 def ask_jev_candidates(client: httpx.Client, state: dict, criteria: dict[str, str]) -> tuple[dict, int, float]:
@@ -468,7 +492,8 @@ def play(game: Joust, bots: tuple[str, str], max_frames: int) -> dict:
     end = riders(game.ram)[:2]
     outs = [out_of_game(r) for r in end]
     winner = None if outs[0] == outs[1] else bots[outs.index(False)] + f" (player {outs.index(False) + 1})"
-    result = {"bots": bots, "frames": frame, "winner": winner, "lives": [r["lives"] for r in end], "start_lives": start_lives,
+    result = {"bots": bots, "frames": frame, "winner": winner, "wave": int(game.ram[WAVE]),
+              "lives": [r["lives"] for r in end], "start_lives": start_lives,
               "score": [score(game.ram, 0), score(game.ram, 1)], "decisions": len(log),
               "jev_calls": len(lats), "input_tokens": tokens, "cost_usd": round(tokens * USD_PER_TOKEN, 5),
               "latency_p50_s": round(float(np.median(lats)), 3) if lats else None}
