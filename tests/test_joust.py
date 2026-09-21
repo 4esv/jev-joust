@@ -78,3 +78,28 @@ def test_the_view_a_player_gets_matches_who_is_higher():
     assert int(g.ram[J.P_Y]) < int(g.ram[J.P_Y + 1]), "p1 should have climbed above p2"
     rival = [o for o in J.situation(g.ram, 0)["riders_near_you"] if o["who"] == "the rival player"][0]
     assert "below you" in rival["summary"]
+
+
+def test_describe_names_the_second_rider_above_you():
+    """The walkthrough's pair ambush: the killer is usually a second rider arriving higher while you
+    commit to the one below. Reporting only the nearest rider hides it."""
+    base = {"died": False, "points": 0, "height": 40, "closed_on_rider": False, "eggs_left": 0,
+            "egg_gain": 0, "egg_dist": None, "at_ceiling": False,
+            "near": {"who": "enemy 1", "dy": -20, "dist": 30}}
+    alone = J.describe(dict(base, threat=None))
+    ambush = J.describe(dict(base, threat={"who": "enemy 2", "dy": 25, "dist": 40}))
+    assert "kill it" in alone and "also above you" not in alone
+    assert "enemy 2 is also above you" in ambush and "kill you while you go for the other" in ambush
+
+
+def test_describe_flags_the_roof():
+    base = {"died": False, "points": 0, "height": 185, "closed_on_rider": False, "eggs_left": 0,
+            "egg_gain": 0, "egg_dist": None, "near": None, "threat": None}
+    assert "against the roof" in J.describe(dict(base, at_ceiling=True))
+    assert "against the roof" not in J.describe(dict(base, at_ceiling=False))
+
+
+@needs_rom
+def test_wave_counter_starts_at_one():
+    g = J.Joust()
+    assert J.situation(g.ram, 0)["wave"] == 1
