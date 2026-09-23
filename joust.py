@@ -2,7 +2,7 @@
 
     uv run python joust.py --scan     # interactive RAM scan: find the bytes that track each player
     uv run python joust.py --frames   # step a few hundred frames with scripted inputs and save a GIF
-    uv run python joust.py --play --p1 jev --p2 jev     # a match; bots are jev, jev-tactic, rules or idle
+    uv run python joust.py --play --p1 jev --p2 jev     # a match; bots are jev, greedy, jev-tactic, jev-noul, rules or idle
 
 The scan drives one controller at a time and reports RAM addresses whose values move with the input,
 which is how the player x/y, lives and enemy slots get located without a published RAM map.
